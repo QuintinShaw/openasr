@@ -1,0 +1,61 @@
+{
+  "schema": "openasr.backend-artifact-fingerprint-fixture.v1",
+  "source_catalog_sha256": "a68d2e8ad878409ff8dc2ea21910a7194a2cfd38913739d65478d3466261eb3a",
+  "entry": {
+    "id": "vulkan-windows-x86_64-6e62deda50a1-generic",
+    "vendor": "vulkan",
+    "version": "0.1.41",
+    "display_name": "OpenASR VULKAN backend",
+    "description": "Optional verified GPU backend for the neutral Windows host.",
+    "targets": [],
+    "min_driver_api": null,
+    "min_cli_version": "0.1.41",
+    "activation": {
+      "state": "published-inert"
+    },
+    "host_abi": {
+      "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
+      "crt": "msvc-md",
+      "fingerprint": "6e62deda50a1d583f945e2ebfb63434e3e9b7f38c5a7d25c9f300241fd33d6da",
+      "ggml_backend_api_version": 3,
+      "ggml_headers_sha256": "713367fedb4ebaf3062d4608286d30d74849463aae88b946289eb8b7abbf2116",
+      "ggml_revision": "29c187be3b84bbf59c6d5bd1099e883443416d32",
+      "openasr_extension_sha256": "e3288d441dba40d1869064116e771dc7eac4ddfd15ae152c3c53e5533e42deef",
+      "openasr_ffi_sha256": "8cd11f67fbcfa00235875d77b48620fd913b6765180b946090dc0bf564f94189",
+      "schema_version": 3,
+      "target": "x86_64-pc-windows-msvc",
+      "toolchain": "msvc-v143"
+    },
+    "files": [
+      {
+        "filename": "openasr-0.1.41-windows-x86_64-vulkan-generic-plugin.dll",
+        "url": "https://dl.openasr.org/core/v0.1.41/openasr-0.1.41-windows-x86_64-vulkan-generic-plugin.dll",
+        "mirrors": [
+          {
+            "source": "github",
+            "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.41/openasr-0.1.41-windows-x86_64-vulkan-generic-plugin.dll"
+          }
+        ],
+        "sha256": "065b429b53ee7af34990c6f0fbedfaeeeb80e7f281cd1ef9a4d8f1545477802f",
+        "size_bytes": 50769680,
+        "role": "plugin"
+      },
+      {
+        "filename": "openasr-vendor-vulkan-loader-85db5c49f739.zip",
+        "url": "https://dl.openasr.org/core/v0.1.41/openasr-vendor-vulkan-loader-85db5c49f739.zip",
+        "mirrors": [
+          {
+            "source": "github",
+            "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.41/openasr-vendor-vulkan-loader-85db5c49f739.zip"
+          }
+        ],
+        "sha256": "85db5c49f739d6523ef236a04bb59daa0cc447b49a717c212dcece521dbd5697",
+        "size_bytes": 460325,
+        "role": "archive",
+        "extract_subdir": "vendor",
+        "extracted_tree_sha256": "3952e09fdaee96cd4a01494b3983df8739805cdc8c564cd12f5ca033ba83bd41"
+      }
+    ]
+  },
+  "fingerprint": "53b04985c84b7615babdc065168114796f31994d2a233c8086bec0d536bca290"
+}

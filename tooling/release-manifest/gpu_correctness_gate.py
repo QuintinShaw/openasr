@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -90,12 +91,12 @@ def _public_models(catalog: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
-def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, list[str]]]:
+def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, list[str], dict[str, Any]]]:
     execution = descriptor.get("execution", {})
     capabilities = execution.get("execution_capabilities", {}) if isinstance(execution, dict) else {}
     optimization = descriptor.get("optimization", {})
     auto_policy = optimization.get("auto_gpu_policy") if isinstance(optimization, dict) else None
-    result: list[tuple[str, str, list[str]]] = []
+    result: list[tuple[str, str, list[str], dict[str, Any]]] = []
     providers = capabilities.get("providers", [])
     if not isinstance(providers, list):
         raise MatrixError(f"family {descriptor.get('catalog_family_id')} has invalid providers")
@@ -109,11 +110,20 @@ def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, li
         modes = ["explicit"]
         if auto_policy == "all-backends" or (auto_policy == "except-metal" and provider != "metal"):
             modes.append("auto")
-        result.append((provider, placement, modes))
+        reuse = item.get("decode_reuse_policy")
+        if (
+            not isinstance(reuse, dict)
+            or set(reuse) != {"graph_mode", "capability_evidence_revision"}
+            or reuse.get("graph_mode") not in {"fresh_graph", "reusable_graph"}
+            or type(reuse.get("capability_evidence_revision")) is not int
+            or reuse["capability_evidence_revision"] <= 0
+        ):
+            raise MatrixError(f"family {descriptor.get('catalog_family_id')} has no typed decode reuse policy")
+        result.append((provider, placement, modes, reuse))
     return result
 
 
-def _lane_policies(provider: str) -> tuple[str, str, str]:
+def _lane_policies(provider: str) -> tuple[str, str]:
     """Return explicit staging policies, not claims of successful hardware runs."""
     # HIP is the sole shipping lane compiled with executable-graph capture.
     # CUDA is currently built with GGML_CUDA_GRAPHS=OFF; CPU, Vulkan, and
@@ -122,9 +132,9 @@ def _lane_policies(provider: str) -> tuple[str, str, str]:
     # distinct `disabled` cell and must provide a native disabled observation.
     capture = "enabled" if provider == "hip" else "unsupported"
     scheduler = "disabled"
-    # Production reuse evidence is currently Unknown, so qualification must
-    # exercise the shipped FreshGraph plan in both cold- and warm-process rows.
-    return capture, scheduler, "fresh_graph"
+    # Reuse is exported by the shared typed runtime planner; it is independent
+    # of executable capture and remains subject to live exact-cell evidence.
+    return capture, scheduler
 
 
 def _tie_policy(family: str) -> str:
@@ -449,11 +459,11 @@ def project_matrix(
         topology = descriptor.get("topology")
         if not isinstance(topology, dict):
             raise MatrixError(f"family {family} has no topology projection")
-        for provider, placement, modes in _advertised_providers(descriptor):
+        for provider, placement, modes, reuse in _advertised_providers(descriptor):
             provider_candidates = backend_candidates.get(provider, [])
             if not provider_candidates:
                 continue
-            capture_mode, scheduler_mode, graph_mode = _lane_policies(provider)
+            capture_mode, scheduler_mode = _lane_policies(provider)
             tie_policy = _tie_policy(family)
             for model in sorted(grouped[family], key=lambda item: str(item["id"])):
                 quants = [
@@ -488,7 +498,8 @@ def project_matrix(
                             "placement": placement,
                             "capture_mode": capture_mode,
                             "scheduler_mode": scheduler_mode,
-                            "graph_mode": graph_mode,
+                            "graph_mode": reuse["graph_mode"],
+                            "capability_evidence_revision": reuse["capability_evidence_revision"],
                             "topology": {
                                 "decode_driver": topology.get("decode_driver"),
                                 "decoder_state": topology.get("decoder_state"),
@@ -1206,13 +1217,17 @@ def parse_full_logits_artifact(path: Path) -> dict[str, Any]:
             or not 0 < row_vocab <= MAX_LOGITS_VOCAB
             or not isinstance(values, list)
             or len(values) != row_vocab
-            or any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) for value in values)
+            or any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in values)
             or selection_ref is None
             or selection_ref in used_selection_refs
         ):
             raise MatrixError(f"{path} contains an invalid or incomplete full logits row")
         if vocab_size is not None and row_vocab != vocab_size:
             raise MatrixError(f"{path} changes vocab_size across full logits rows")
+        try:
+            values = [_finite_f32(value) for value in values]
+        except MatrixError as error:
+            raise MatrixError(f"{path} contains an invalid or incomplete full logits row: {error}") from error
         vocab_size = row_vocab
         used_selection_refs.add(selection_ref)
         rows[step] = {"compute": selection_ref, "values": values}
@@ -1237,6 +1252,38 @@ def parse_full_logits_artifact(path: Path) -> dict[str, Any]:
         "rows": rows,
         "vocab_size": vocab_size,
     }
+
+
+def _finite_f32(value: Any) -> float:
+    # JSON has no binary32 type. serde may emit either a shortest f32 decimal
+    # or the exact f32 promoted to f64. Recover the declared dtype before
+    # comparing; this does not introduce a numeric tolerance.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MatrixError("expected a finite f32 number")
+    try:
+        converted = struct.unpack("<f", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error) as error:
+        raise MatrixError("number is not representable as finite f32") from error
+    if not math.isfinite(converted):
+        raise MatrixError("number is not representable as finite f32")
+    return converted
+
+
+def _f32_top_k(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        raise MatrixError("invalid f32 top-k items")
+    result = []
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"token_id", "value"}
+            or not isinstance(item["token_id"], int)
+            or isinstance(item["token_id"], bool)
+            or item["token_id"] < 0
+        ):
+            raise MatrixError("invalid f32 top-k item")
+        result.append({"token_id": item["token_id"], "value": _finite_f32(item["value"])})
+    return result
 
 
 def _require_full_logits_match(
@@ -1283,10 +1330,10 @@ def _require_full_logits_match(
             {"token_id": index, "value": values[index]}
             for index in order[: len(topk["items"])]
         ]
-        if topk["items"] != expected_top:
+        if _f32_top_k(topk["items"]) != expected_top:
             raise MatrixError(f"{receipt_path} top-k trace does not match complete logits")
-        expected_margin = values[order[0]] - values[order[1]]
-        if topk["margin"] != expected_margin:
+        expected_margin = _finite_f32(values[order[0]] - values[order[1]])
+        if _finite_f32(topk["margin"]) != expected_margin:
             raise MatrixError(f"{receipt_path} top-k margin does not match complete logits")
         expected_summaries[step] = (expected_top, expected_margin)
 
@@ -1298,8 +1345,8 @@ def _require_full_logits_match(
         not isinstance(summary_top, list)
         or not summary_top
         or len(summary_top) > len(expected_summary_top)
-        or summary_top != expected_summary_top[: len(summary_top)]
-        or summary_margin != expected_summary_margin
+        or _f32_top_k(summary_top) != expected_summary_top[: len(summary_top)]
+        or _finite_f32(summary_margin) != expected_summary_margin
     ):
         raise MatrixError(f"{receipt_path} receipt top-k summary does not match complete logits")
 
@@ -1460,6 +1507,8 @@ def expected_receipt_keys(matrix: dict[str, Any]) -> tuple[
             raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks capture/scheduler policy")
         if cell.get("graph_mode") not in {"fresh_graph", "reusable_graph"}:
             raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks graph-mode policy")
+        if type(cell.get("capability_evidence_revision")) is not int or cell["capability_evidence_revision"] <= 0:
+            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks decode evidence revision")
         plan = cell["output_plan"]
         if plan.get("kind") not in {"full_logits", "complete_scores", "native_first_max_token"} or plan.get("tie_policy") not in {"first_maximum", "last_maximum"}:
             raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks a concrete output plan")
@@ -1676,6 +1725,8 @@ def closed_receipt_keys(
         if (
             not isinstance(decode_diagnostics, dict)
             or decode_diagnostics.get("reuse_mode") != lane["graph_mode"]
+            or type(decode_diagnostics.get("capability_evidence_revision")) is not int
+            or decode_diagnostics["capability_evidence_revision"] != lane["capability_evidence_revision"]
         ):
             raise MatrixError(f"{path} graph mode does not match its matrix cell")
         key = (
@@ -2635,7 +2686,7 @@ def bind_runtime_cell_receipts(
         or diagnostics.get("output_plan") != cell["output_plan"]["kind"]
         or diagnostics.get("reuse_mode") != cell["graph_mode"]
         or type(diagnostics.get("capability_evidence_revision")) is not int
-        or diagnostics["capability_evidence_revision"] <= 0
+        or diagnostics["capability_evidence_revision"] != cell["capability_evidence_revision"]
     ):
         raise MatrixError("GPU receipt did not execute the projected output/graph plan")
     _require_runtime_placement(

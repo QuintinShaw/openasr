@@ -450,6 +450,9 @@ pub(crate) fn bench_receipt_short_audio(
             } else {
                 NativeExecutionTraceMode::Reuse
             });
+            if options.trace_out.is_some() {
+                receipt.enable_full_graph_trace();
+            }
             if (options.logits_out.is_some() || !options.write_outputs) && !is_warmup {
                 receipt.enable_full_logits_trace();
             }
@@ -1106,7 +1109,7 @@ fn fixed_receipt_and_trace_targets(
 ) -> Result<(ResolvedOutputTarget, ResolvedOutputTarget)> {
     let receipt = resolve_output_target_handle(receipt)?;
     let trace = resolve_output_target_handle(trace)?;
-    if receipt.path() == trace.path() {
+    if receipt.same_destination(&trace)? {
         bail!("--out and --trace-out must name different output targets");
     }
     Ok((receipt, trace))
@@ -1123,9 +1126,8 @@ fn fixed_receipt_trace_and_logits_targets(
 )> {
     let (receipt, trace) = fixed_receipt_and_trace_targets(receipt, trace)?;
     let logits = logits.map(resolve_output_target_handle).transpose()?;
-    if logits
-        .as_ref()
-        .is_some_and(|logits| logits.path() == receipt.path() || logits.path() == trace.path())
+    if let Some(logits) = &logits
+        && (logits.same_destination(&receipt)? || logits.same_destination(&trace)?)
     {
         bail!("--logits-out must name a different target from --out and --trace-out");
     }
@@ -1573,7 +1575,7 @@ fn validate_strict_runtime_trace(jsonl: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_full_logits_trace(logits_jsonl: &str, token_jsonl: &str) -> Result<()> {
+pub(crate) fn validate_full_logits_trace(logits_jsonl: &str, token_jsonl: &str) -> Result<()> {
     let token_events = token_jsonl
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -1817,6 +1819,18 @@ fn validate_observed_accelerator_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn fixed_windows_trace_targets_reject_case_aliases_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let receipt = temp.path().join("Receipt.json");
+        let alias = temp.path().join("receipt.JSON");
+        let trace = temp.path().join("trace.jsonl");
+        assert!(fixed_receipt_and_trace_targets(&receipt, &alias).is_err());
+        assert!(fixed_receipt_trace_and_logits_targets(&receipt, &trace, Some(&alias)).is_err());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
     use openasr_core::{
         SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceiptOutputPlan,
         ShortAudioReceiptReuseMode,

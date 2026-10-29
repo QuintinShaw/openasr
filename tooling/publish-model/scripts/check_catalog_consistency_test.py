@@ -131,7 +131,7 @@ class CommittedRegistryGateTest(unittest.TestCase):
         registry = copy_registry()
         try:
             catalog = registry / "catalog.json"
-            catalog.write_text(catalog.read_text() + " \n", encoding="utf-8")
+            catalog.write_text(catalog.read_text(encoding="utf-8") + " \n", encoding="utf-8")
             failures = run_gate(registry_dir=registry, allow_dev_key=False)
             self.assertTrue(
                 any("content hash mismatch" in failure for failure in failures),

@@ -450,6 +450,14 @@ struct GgmlLaneReuseEvidence {
 }
 
 impl GgmlLaneReuseEvidence {
+    const fn mode(self) -> GgmlDecodeReuseMode {
+        if self.is_validated() {
+            GgmlDecodeReuseMode::ReusableGraph
+        } else {
+            GgmlDecodeReuseMode::FreshGraph
+        }
+    }
+
     const fn unknown() -> Self {
         Self {
             persistent_input_refresh: GgmlLaneEvidence::Unknown,
@@ -558,6 +566,20 @@ impl GgmlLaneDecodeEvidence {
 }
 
 const GGML_DECODE_LANE_EVIDENCE_REVISION: u64 = 2;
+
+/// Conditional planner policy for an admitted provider lane, not proof that a
+/// device exists or that a particular request executed on it. Qualification
+/// still requires live placement, graph lifecycle and complete-output evidence.
+pub(crate) fn provider_decode_reuse_policy(
+    provider: ExecutionProvider,
+) -> (GgmlDecodeReuseMode, u64) {
+    let evidence = if discrete_gpu_reuse_is_proven(provider) {
+        GgmlLaneDecodeEvidence::discrete_gpu_reusable_full_logits()
+    } else {
+        GgmlLaneDecodeEvidence::unknown()
+    };
+    (evidence.reuse.mode(), GGML_DECODE_LANE_EVIDENCE_REVISION)
+}
 
 fn lane_decode_evidence_for_preference(
     preference: Option<&RequestBackendPreference>,
@@ -1290,11 +1312,7 @@ impl ResolvedFamilyRuntimeInput {
             decode_evidence: evidence,
             evidence_revision: GGML_DECODE_LANE_EVIDENCE_REVISION,
             output_plan: plan_decode_output(output_contract, evidence, logits_consumers),
-            reuse_mode: if evidence.reuse.is_validated() {
-                GgmlDecodeReuseMode::ReusableGraph
-            } else {
-                GgmlDecodeReuseMode::FreshGraph
-            },
+            reuse_mode: evidence.reuse.mode(),
         }
     }
 
@@ -2193,9 +2211,15 @@ impl GgmlGraphLifecycleState {
     fn input_written(&mut self, bytes: usize) {
         let input_generation = super::mint_opaque_graph_id();
         self.latest_input_generation = Some(input_generation);
-        let _ = bytes;
-        // InputWrite events are not consulted by graph_rebuilt binding and
-        // dominated HIP/Vulkan longform receipts (thousands per request).
+        // Ordinary graph-reuse receipts omit these high-volume events.
+        // Strict diagnostics need the actual completed upload, never a
+        // reconstructed write inferred from the next compute generation.
+        if self.collector.full_compute_trace_enabled() {
+            self.record(super::GgmlGraphLifecycleEventKind::InputWrite {
+                input_generation,
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            });
+        }
     }
 
     fn compute_started(&mut self) -> u64 {
@@ -2221,7 +2245,9 @@ impl GgmlGraphLifecycleState {
         // Keep the first few computes so decode-conformance (2-step Layer-2,
         // 4-step reusable quadrant) still sees a complete event chain. Zipformer
         // decode then stops appending (hundreds of steps per request).
-        compute_sequence <= 4 || !self.skip_further_native_capture_observe()
+        self.collector.full_compute_trace_enabled()
+            || compute_sequence <= 4
+            || !self.skip_further_native_capture_observe()
     }
 
     fn capture_is_settled_unsupported(&self) -> bool {
@@ -2230,7 +2256,8 @@ impl GgmlGraphLifecycleState {
     }
 
     fn skip_further_native_capture_observe(&self) -> bool {
-        self.skip_further_native_capture || self.capture_is_settled_unsupported()
+        !self.collector.full_compute_trace_enabled()
+            && (self.skip_further_native_capture || self.capture_is_settled_unsupported())
     }
 
     fn observe_native_capture(
@@ -8012,7 +8039,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let capture_unsupported = THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS
             .try_with(|addrs| addrs.borrow().contains(&backend_addr))
             .unwrap_or(false);
-        if capture_unsupported {
+        if capture_unsupported
+            && !self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.collector.full_compute_trace_enabled())
+        {
             return Ok(());
         }
         let Some(observation) = self.backend_graph_lifecycle.observe(self.backend, graph)? else {
@@ -8508,6 +8540,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(self.compute_outputs_f32_with_evidence(outputs)?.value)
     }
 
+    /// The first output is the primary buffer bound by the returned witness.
+    /// Later outputs are auxiliary state/attention: checked readbacks, never
+    /// additional selection buffers under that same compute identity.
     pub(crate) fn compute_outputs_f32_with_evidence(
         &mut self,
         outputs: &[(GgmlCpuTensor<'a>, usize)],
@@ -8555,7 +8590,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
         let mut results = Vec::with_capacity(outputs.len());
         let mut compute_evidence = None;
-        for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
+        for (index, ((output, expected_len), output_nbytes)) in
+            outputs.iter().zip(output_nbytes).enumerate()
+        {
             let mut values = vec![0.0f32; *expected_len];
             let status = unsafe {
                 read_tensor_bytes(
@@ -8565,20 +8602,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            let output_evidence = self.finish_output_read(status, output_nbytes)?;
-            if self.lifecycle.is_some() && output_evidence.is_none() {
-                return Err(self.fail_output_evidence(
-                    "successful output readback did not produce a compute evidence ref",
-                ));
+            if index == 0 {
+                compute_evidence = self.finish_output_read(status, output_nbytes)?;
+                if self.lifecycle.is_some() && compute_evidence.is_none() {
+                    return Err(self.fail_output_evidence(
+                        "successful primary readback did not produce a compute evidence ref",
+                    ));
+                }
+            } else {
+                self.finish_readback_status(status)?;
             }
-            if let (Some(expected), Some(actual)) = (compute_evidence, output_evidence)
-                && expected != actual
-            {
-                return Err(self.fail_output_evidence(
-                    "one graph compute produced inconsistent output evidence refs",
-                ));
-            }
-            compute_evidence = compute_evidence.or(output_evidence);
             results.push(values);
         }
         Ok(GgmlComputeOutput {
@@ -8604,7 +8637,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     /// Same direct-into-caller-storage readback as [`Self::compute_outputs_into_f32`],
-    /// but keeps the compute witness minted by a successful output read.
+    /// but keeps the compute witness minted by reading the first output.
+    /// That primary buffer contains the selection logits; later buffers are
+    /// auxiliary state and cannot borrow its selection witness. Any failed
+    /// auxiliary read still poisons the graph and fails the entire operation.
     /// Seq2seq token-step receipts must use this; dropping the ref is how
     /// growing-KV Granite steps recorded tokens with `compute: None`.
     pub(crate) fn compute_outputs_into_f32_with_evidence(
@@ -8650,7 +8686,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.compute_graph_with_memory_gate(graph)?;
 
         let mut compute_evidence = None;
-        for (output, target) in outputs.iter_mut() {
+        for (index, (output, target)) in outputs.iter_mut().enumerate() {
             let nbytes = target.len() * F32_WIDTH_BYTES;
             let status = unsafe {
                 read_tensor_bytes(
@@ -8660,20 +8696,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     nbytes,
                 )
             };
-            let output_evidence = self.finish_output_read(status, nbytes)?;
-            if self.lifecycle.is_some() && output_evidence.is_none() {
-                return Err(self.fail_output_evidence(
-                    "successful output readback did not produce a compute evidence ref",
-                ));
+            if index == 0 {
+                compute_evidence = self.finish_output_read(status, nbytes)?;
+                if self.lifecycle.is_some() && compute_evidence.is_none() {
+                    return Err(self.fail_output_evidence(
+                        "successful primary readback did not produce a compute evidence ref",
+                    ));
+                }
+            } else {
+                self.finish_readback_status(status)?;
             }
-            if let (Some(expected), Some(actual)) = (compute_evidence, output_evidence)
-                && expected != actual
-            {
-                return Err(self.fail_output_evidence(
-                    "one graph compute produced inconsistent output evidence refs",
-                ));
-            }
-            compute_evidence = compute_evidence.or(output_evidence);
         }
         Ok(compute_evidence.and_then(|evidence| evidence.selection(0, 1)))
     }
@@ -10518,6 +10550,7 @@ thread_local! {
     /// Test-only seam: substitutes the next tensor-get completion status after
     /// a graph has computed successfully. Cleared after one use.
     static TEST_TENSOR_READBACK_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
+    static TEST_TENSOR_READBACK_STATUS_DELAY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -10558,11 +10591,19 @@ pub(crate) fn reset_test_tensor_readback_count() {
 
 #[cfg(test)]
 fn take_test_tensor_readback_status_override() -> Option<c_int> {
+    if TEST_TENSOR_READBACK_STATUS_DELAY.with(|delay| {
+        let remaining = delay.get();
+        delay.set(remaining.saturating_sub(1));
+        remaining > 0
+    }) {
+        return None;
+    }
     TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take())
 }
 
 #[cfg(test)]
 pub(crate) fn install_test_tensor_readback_status_override(status: c_int) {
+    TEST_TENSOR_READBACK_STATUS_DELAY.with(|delay| delay.set(0));
     TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
 }
 
@@ -13898,6 +13939,125 @@ mod tests {
         );
     }
 
+    fn multi_output_primary_evidence_case(in_place: bool, fail_auxiliary: bool) {
+        reset_test_tensor_readback_count();
+        reset_test_compute_gate_attempt_count();
+        let collector = GgmlGraphLifecycleCollector::new();
+        let _guard = collector.install();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(3, "primary input").unwrap();
+        let state = graph.new_tensor_1d_f32(2, "auxiliary input").unwrap();
+        graph.set_input(input).unwrap();
+        graph.set_input(state).unwrap();
+        let primary = graph.add(input, input).unwrap();
+        let auxiliary = graph.add(state, state).unwrap();
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0], "primary")
+            .unwrap();
+        graph
+            .set_f32_slice(state, &[4.0, 5.0], "auxiliary")
+            .unwrap();
+        if fail_auxiliary {
+            install_test_tensor_readback_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+            super::TEST_TENSOR_READBACK_STATUS_DELAY.with(|delay| delay.set(1));
+        }
+        let result = if in_place {
+            let mut primary_target = [-1.0; 3];
+            let mut auxiliary_target = [-1.0; 2];
+            let result = graph.compute_outputs_into_f32_with_evidence(&mut [
+                (primary, primary_target.as_mut_slice()),
+                (auxiliary, auxiliary_target.as_mut_slice()),
+            ]);
+            if result.is_ok() {
+                assert_eq!(primary_target, [2.0, 4.0, 6.0]);
+                assert_eq!(auxiliary_target, [8.0, 10.0]);
+            }
+            result
+        } else {
+            graph
+                .compute_outputs_f32_with_evidence(&[(primary, 3), (auxiliary, 2)])
+                .map(|output| {
+                    let (values, evidence) = output.into_parts();
+                    assert_eq!(values, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0]]);
+                    evidence
+                })
+        };
+        assert_eq!(
+            test_tensor_readback_count(),
+            2,
+            "both readbacks were attempted"
+        );
+        let snapshot = collector.snapshot();
+        let reads = snapshot
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                GgmlGraphLifecycleEventKind::OutputRead {
+                    bytes,
+                    compute_sequence,
+                    output_generation_consumed,
+                } => Some((
+                    bytes,
+                    (
+                        event.graph_instance,
+                        event.graph_generation,
+                        compute_sequence,
+                        output_generation_consumed,
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reads.len(),
+            1,
+            "auxiliary state must not mint a selection read"
+        );
+        assert_eq!(
+            reads[0].0, 12,
+            "read size must describe only the primary logits"
+        );
+        if fail_auxiliary {
+            assert!(matches!(result, Err(GgmlCpuGraphError::ExecutionFailed)));
+            assert!(snapshot.events.iter().any(|event| matches!(
+                event.kind,
+                GgmlGraphLifecycleEventKind::Poisoned {
+                    reason: super::super::GgmlGraphPoisonReason::ReadbackFailed
+                }
+            )));
+            assert!(matches!(
+                graph.compute_output_f32_with_evidence(primary, 3),
+                Err(GgmlCpuGraphError::GraphSessionPoisoned)
+            ));
+            assert_eq!(test_tensor_readback_count(), 2);
+            assert_eq!(test_compute_gate_attempt_count(), 1);
+        } else {
+            assert_eq!(result.unwrap().unwrap().compute_identity(), reads[0].1);
+        }
+    }
+
+    #[test]
+    fn allocated_multi_output_witness_binds_only_primary_logits() {
+        multi_output_primary_evidence_case(false, false);
+    }
+
+    #[test]
+    fn caller_storage_multi_output_witness_binds_only_primary_logits() {
+        multi_output_primary_evidence_case(true, false);
+    }
+
+    #[test]
+    fn allocated_auxiliary_read_failure_poisons_after_primary_read() {
+        multi_output_primary_evidence_case(false, true);
+    }
+
+    #[test]
+    fn caller_storage_auxiliary_read_failure_poisons_after_primary_read() {
+        multi_output_primary_evidence_case(true, true);
+    }
+
     #[test]
     fn compute_outputs_into_f32_terminal_compute_has_zero_readback_and_preserves_targets() {
         super::reset_test_tensor_readback_count();
@@ -14693,10 +14853,11 @@ mod tests {
                 let flag = Arc::new(AtomicBool::new(canceled));
                 let previous =
                     crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
-                let mut runner =
-                    GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
-                        .expect("cpu graph runner");
+                // Release every participant even when backend initialization fails.
+                // Otherwise a useful initialization error leaves the test hung.
+                let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default());
                 barrier.wait();
+                let mut runner = runner.expect("cpu graph runner");
                 let result = runner.compute_add_f32(&[1.0, 2.0], &[3.0, 4.0]);
                 assert!(
                     crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous)
@@ -15450,6 +15611,49 @@ mod tests {
                 GgmlDecodeOutputPlan::FullLogits,
                 "complete-logits consumers must not compact on unproven {provider:?}"
             );
+        }
+    }
+
+    #[test]
+    fn exported_reuse_policy_matches_planner_for_all_provider_capabilities() {
+        use crate::device::execution_route::ExecutionProvider;
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let backend = match provider {
+                ExecutionProvider::Cpu => super::GgmlCpuGraphBackend::Cpu,
+                ExecutionProvider::Metal => super::GgmlCpuGraphBackend::Metal,
+                _ => super::GgmlCpuGraphBackend::Gpu,
+            };
+            for native_argmax in [false, true] {
+                let capabilities =
+                    super::GgmlBackendCapabilities::resolve(backend, provider.as_str())
+                        .with_native_argmax_first_op(native_argmax);
+                let evidence = super::lane_decode_evidence_for_backend_capabilities(
+                    backend,
+                    capabilities,
+                    provider,
+                );
+                let (exported, revision) = super::provider_decode_reuse_policy(provider);
+                assert_eq!(
+                    exported,
+                    evidence.reuse.mode(),
+                    "{provider:?} argmax={native_argmax}"
+                );
+                assert_eq!(revision, super::GGML_DECODE_LANE_EVIDENCE_REVISION);
+                if matches!(
+                    provider,
+                    ExecutionProvider::Unknown | ExecutionProvider::Accelerator
+                ) {
+                    assert_eq!(exported, super::GgmlDecodeReuseMode::FreshGraph);
+                }
+            }
         }
     }
 
@@ -16372,6 +16576,102 @@ mod tests {
             Some(true),
             "persistent sessions must opt the owned cgraph into native capture"
         );
+    }
+
+    #[test]
+    fn full_graph_trace_survives_warmup_and_records_every_native_compute() {
+        use super::super::backend_graph_lifecycle::BackendGraphLifecycleBinding;
+        let ordinary = GgmlGraphLifecycleCollector::new();
+        let ordinary_guard = ordinary.install();
+        let mut runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default()).unwrap();
+        let mut session = runner.start_persistent_graph_session(1024 * 1024).unwrap();
+        let graph = session.builder();
+        let input = graph.new_tensor_1d_f32(1, "trace input").unwrap();
+        graph.set_input(input).unwrap();
+        let output = graph.mul(input, input).unwrap();
+        graph.set_output(output).unwrap();
+        graph.prepare_outputs_for_upload(&[output]).unwrap();
+        graph.set_f32_slice(input, &[2.0], "warmup").unwrap();
+        assert_eq!(graph.compute_output_f32(output, 1).unwrap(), [4.0]);
+        assert!(
+            !ordinary
+                .snapshot()
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, GgmlGraphLifecycleEventKind::InputWrite { .. }))
+        );
+        drop(ordinary_guard);
+
+        // Simulate the performance cache left by a prior unsupported probe.
+        // A complete diagnostic must query the binding despite that cache.
+        let backend_addr = graph.backend.as_ptr() as usize;
+        super::THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS.with(|cache| {
+            cache.borrow_mut().insert(backend_addr);
+        });
+        let full = GgmlGraphLifecycleCollector::new();
+        full.enable_full_compute_trace();
+        let _full_guard = full.install();
+        let native_observer_available = matches!(
+            graph.backend_graph_lifecycle,
+            BackendGraphLifecycleBinding::Available { .. }
+        );
+        for value in 1..=9 {
+            let value = value as f32;
+            graph
+                .set_f32_slice(input, &[value], "diagnostic input")
+                .unwrap();
+            assert_eq!(
+                graph.compute_output_f32(output, 1).unwrap(),
+                [value * value]
+            );
+        }
+        let events = full.snapshot().events;
+        let mut latest_input = None;
+        let mut counts = [0_usize; 5];
+        for event in events {
+            match event.kind {
+                GgmlGraphLifecycleEventKind::InputWrite {
+                    input_generation,
+                    bytes,
+                } => {
+                    assert_eq!(bytes, 4);
+                    latest_input = Some(input_generation);
+                    counts[0] += 1;
+                }
+                GgmlGraphLifecycleEventKind::ComputeStarted {
+                    input_generation_consumed,
+                    ..
+                } => {
+                    assert_eq!(input_generation_consumed, latest_input);
+                    assert!(latest_input.is_some());
+                    counts[1] += 1;
+                }
+                GgmlGraphLifecycleEventKind::ComputeCompleted { .. } => counts[2] += 1,
+                GgmlGraphLifecycleEventKind::OutputRead { .. } => counts[3] += 1,
+                GgmlGraphLifecycleEventKind::CaptureStateObserved { .. } => counts[4] += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(&counts[..4], &[9, 9, 9, 9]);
+        assert_eq!(counts[4], if native_observer_available { 18 } else { 0 });
+
+        // A cached unsupported result must not hide a malformed live binding.
+        graph.backend_graph_lifecycle = BackendGraphLifecycleBinding::Incompatible;
+        graph
+            .set_f32_slice(input, &[3.0], "failing diagnostic")
+            .unwrap();
+        assert!(matches!(
+            graph.compute_output_f32(output, 1),
+            Err(GgmlCpuGraphError::GraphLifecycleEvidenceFailed { .. })
+        ));
+        assert!(matches!(
+            graph.compute_output_f32(output, 1),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        super::THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS.with(|cache| {
+            cache.borrow_mut().remove(&backend_addr);
+        });
     }
 
     #[test]

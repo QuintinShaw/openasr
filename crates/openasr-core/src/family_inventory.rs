@@ -102,6 +102,13 @@ pub struct ExecutionProviderInventoryV1 {
     pub provider: String,
     pub full_device: bool,
     pub hybrid: bool,
+    pub decode_reuse_policy: DecodeReusePolicyInventoryV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecodeReusePolicyInventoryV1 {
+    pub graph_mode: String,
+    pub capability_evidence_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -483,10 +490,19 @@ fn project_execution_capabilities(
         let full_device = capabilities.supports(provider, ExecutionPlacement::FullDevice);
         let hybrid = capabilities.supports(provider, ExecutionPlacement::Hybrid);
         if full_device || hybrid {
+            let (reuse, revision) = crate::ggml_runtime::provider_decode_reuse_policy(provider);
             providers.push(ExecutionProviderInventoryV1 {
                 provider: provider.as_str().to_string(),
                 full_device,
                 hybrid,
+                decode_reuse_policy: DecodeReusePolicyInventoryV1 {
+                    graph_mode: match reuse {
+                        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph => "fresh_graph",
+                        crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph => "reusable_graph",
+                    }
+                    .to_string(),
+                    capability_evidence_revision: revision,
+                },
             });
         }
     }
@@ -499,6 +515,34 @@ fn project_execution_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_reuse_policy_is_the_shared_planner_projection() {
+        use crate::device::execution_route::ExecutionProvider;
+        for family in builtin_model_family_inventory().families {
+            for provider in family.execution.execution_capabilities.providers {
+                let typed = match provider.provider.as_str() {
+                    "cuda" => ExecutionProvider::Cuda,
+                    "hip" => ExecutionProvider::Hip,
+                    "vulkan" => ExecutionProvider::Vulkan,
+                    "metal" => ExecutionProvider::Metal,
+                    "accelerator" => ExecutionProvider::Accelerator,
+                    "unknown" => ExecutionProvider::Unknown,
+                    other => panic!("unexpected provider {other}"),
+                };
+                let (mode, revision) = crate::ggml_runtime::provider_decode_reuse_policy(typed);
+                let expected = match mode {
+                    crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph => "fresh_graph",
+                    crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph => "reusable_graph",
+                };
+                assert_eq!(provider.decode_reuse_policy.graph_mode, expected);
+                assert_eq!(
+                    provider.decode_reuse_policy.capability_evidence_revision,
+                    revision
+                );
+            }
+        }
+    }
 
     #[test]
     fn inventory_is_sorted_and_has_unique_architectures() {

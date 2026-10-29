@@ -1,4 +1,5 @@
 import argparse
+import copy
 import hashlib
 import json
 import struct
@@ -32,6 +33,35 @@ def minimal_pe(marker: bytes, certificate: bytes = b"") -> bytes:
 
 
 class BackendCatalogTest(unittest.TestCase):
+    def test_fingerprint_matches_native_fixture_for_null_and_absent_optionals(self):
+        fixture_path = Path(__file__).resolve().parents[2] / "crates/openasr-core/tests/fixtures/backend_artifact_fingerprint.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for omit in (False, True):
+            with self.subTest(omit=omit):
+                entry = copy.deepcopy(fixture["entry"])
+                if omit:
+                    entry.pop("min_driver_api", None)
+                else:
+                    entry["min_driver_api"] = None
+                for file in entry["files"]:
+                    for key in ("extract_subdir", "extracted_tree_sha256"):
+                        if file.get(key) is None:
+                            if omit:
+                                file.pop(key, None)
+                            else:
+                                file[key] = None
+                self.assertEqual(backend_catalog.artifact_fingerprint(entry), fixture["fingerprint"])
+                entry["min_driver_api"] = "1.3.0"
+                self.assertNotEqual(backend_catalog.artifact_fingerprint(entry), fixture["fingerprint"])
+
+    def test_fingerprint_rejects_non_string_optional_metadata(self):
+        entry = {"min_driver_api": True}
+        with self.assertRaises(backend_catalog.BackendCatalogError):
+            backend_catalog.artifact_fingerprint(entry)
+        for key in ("extract_subdir", "extracted_tree_sha256"):
+            with self.subTest(key=key), self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.artifact_fingerprint({"files": [{key: 1}]})
+
     def test_json_writer_is_utf8_with_lf_on_every_host(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "catalog.json"

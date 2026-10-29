@@ -24,6 +24,19 @@ The shared software migration is in place:
 - same-graph dual output, fresh/reuse four-quadrant, backend-op, Layer-3, and
   release-matrix gates are separate; missing, stale, deferred, or mismatched
   cells fail closed;
+- the inventory's per-provider `decode_reuse_policy` projects the shared
+  planner's conditional graph mode and capability evidence revision. Matrix
+  generation consumes that policy instead of maintaining another provider
+  reuse table, and both binding and final validation require the exact revision.
+  This projection is not live device admission or successful hardware evidence;
+  complete logits, observed placement, graph lifecycle, capture/scheduler and
+  same-process cold/reuse evidence remain independent requirements;
+- Windows strict receipt/trace output pins local-volume directory objects and
+  uses root-relative native IO, same-handle publication and failure cleanup.
+  Final symlink/reparse changes and sibling case aliases fail closed. Network
+  paths without local-volume identity remain unsupported. Windows flushes the
+  staged file before and after publication; these tests do not claim Unix
+  directory-fsync semantics or power-loss qualification;
 - the signed-artifact qualification child now runs one backend-neutral,
   exact-route Layer-1/Layer-2/production-width four-quadrant suite and its
   parent strictly revalidates the typed result against the prepared artifacts;
@@ -61,8 +74,9 @@ The shared software migration is in place:
   `sensevoice-small:q8_0`, `xasr-zh-en:q8_0`, `whisper-tiny:q4_k`, and
   `whisper-small:q4_k`. Compact remains off. HIP and Vulkan reuse evidence is
   now planner-validated (`ReusableGraph` + `FullLogits` resident KV) so FunASR
-  q4_k HIP no longer rebuilds a host-KV graph every token; CUDA stays
-  `FreshGraph`. These are still not a production-catalog or Authenticode cell;
+  q4_k HIP no longer rebuilds a host-KV graph every token. The current shared
+  planner also selects `ReusableGraph` on admitted CUDA lanes. These are still
+  not a production-catalog or Authenticode cell;
 - native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
   infinity in a row yields the `-1` sentinel, which request decoding rejects
   instead of accepting a provider-dependent token;

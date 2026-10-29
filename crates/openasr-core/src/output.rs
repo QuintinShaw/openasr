@@ -17,6 +17,9 @@ use thiserror::Error;
 mod output_atomic;
 #[path = "output_path.rs"]
 mod output_path;
+#[cfg(windows)]
+#[path = "output_windows.rs"]
+mod output_windows;
 
 #[derive(Debug, Error)]
 pub enum OutputWriteError {
@@ -89,6 +92,13 @@ pub enum OutputWriteError {
         cleanup_warning: Option<String>,
     },
     #[error(
+        "Output was published to {path}, but final synchronization failed. Inspect the destination before retrying. Details: {source}"
+    )]
+    PublishedSync {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(
         "Could not replace output atomically: {path}\nThe existing final output was left unchanged when possible. Details: {source}"
     )]
     Persist {
@@ -121,7 +131,8 @@ impl OutputWriteError {
             | Self::ParentNotDirectory { .. }
             | Self::CreateTemp { .. }
             | Self::ResolveSymlink { .. }
-            | Self::ExistingOutputNotWritable { .. } => None,
+            | Self::ExistingOutputNotWritable { .. }
+            | Self::PublishedSync { .. } => None,
         }
     }
 }
@@ -144,11 +155,25 @@ pub struct ResolvedOutputTarget {
     directory: fs::File,
     #[cfg(unix)]
     basename: CString,
+    #[cfg(windows)]
+    _directories: Vec<fs::File>,
 }
 
 impl ResolvedOutputTarget {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Conservatively reject destination aliases before publishing siblings.
+    pub fn same_destination(&self, other: &Self) -> Result<bool, OutputWriteError> {
+        #[cfg(windows)]
+        {
+            output_windows::same_destination(self, other)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(self.path == other.path)
+        }
     }
 
     #[cfg(unix)]
@@ -161,19 +186,30 @@ impl ResolvedOutputTarget {
         write_relative_to_directory(self, content, true)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub fn atomic_write_text(&self, content: &str) -> Result<(), OutputWriteError> {
+        output_windows::write(self, content, false)
+    }
+
+    #[cfg(windows)]
+    pub fn create_new_text_and_sync_parent(&self, content: &str) -> Result<(), OutputWriteError> {
+        output_windows::write(self, content, true)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn atomic_write_text(&self, _content: &str) -> Result<(), OutputWriteError> {
         Err(unsupported_pinned_target(&self.path))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn create_new_text_and_sync_parent(&self, _content: &str) -> Result<(), OutputWriteError> {
         Err(unsupported_pinned_target(&self.path))
     }
 }
 
 /// Resolve a target and bind it to a controlled parent directory handle.
-/// Non-Unix builds fail closed rather than claiming equivalent path pinning.
+/// Windows pins local-volume directory handles and uses root-relative IO;
+/// other platforms fail closed rather than claiming equivalent path pinning.
 pub fn resolve_output_target_handle(
     path: impl AsRef<Path>,
 ) -> Result<ResolvedOutputTarget, OutputWriteError> {
@@ -211,13 +247,17 @@ pub fn resolve_output_target_handle(
             basename,
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        output_windows::resolve(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(unsupported_pinned_target(&path))
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn unsupported_pinned_target(path: &Path) -> OutputWriteError {
     OutputWriteError::ResolveSymlink {
         path: path.to_path_buf(),
@@ -377,10 +417,9 @@ fn write_relative_to_directory(
     target
         .directory
         .sync_all()
-        .map_err(|source| OutputWriteError::Sync {
+        .map_err(|source| OutputWriteError::PublishedSync {
             path: target.path.clone(),
             source,
-            cleanup_warning: None,
         })
 }
 

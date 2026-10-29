@@ -64,6 +64,7 @@ pub(crate) use backend_memory::{
 };
 #[allow(unused_imports)]
 pub(crate) use cpu_graph::GgmlLstmGateOrder;
+pub(crate) use cpu_graph::provider_decode_reuse_policy;
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlDecodeLogitsConsumers,
