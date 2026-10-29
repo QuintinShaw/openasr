@@ -74,22 +74,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -205,22 +221,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": true
+              "hybrid": true,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -327,22 +359,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -451,22 +499,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -574,22 +638,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -710,22 +790,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -857,22 +953,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -970,22 +1082,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": false,
-              "hybrid": true
+              "hybrid": true,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1101,22 +1229,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1211,22 +1355,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1351,22 +1511,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1497,22 +1673,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1609,22 +1801,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1717,22 +1925,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -1922,22 +2146,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },
@@ -2037,22 +2277,38 @@
             {
               "provider": "cuda",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "hip",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "metal",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
             },
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
             }
           ]
         },

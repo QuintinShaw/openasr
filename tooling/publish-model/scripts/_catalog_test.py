@@ -102,6 +102,12 @@ class ModelFamilyInventoryTest(unittest.TestCase):
 
     def test_execution_typed_capability_projection(self) -> None:
         inventory = load_model_family_inventory()
+        for family in inventory.values():
+            for provider in family["execution"]["execution_capabilities"]["providers"]:
+                policy = provider["decode_reuse_policy"]
+                self.assertIn(policy["graph_mode"], {"fresh_graph", "reusable_graph"})
+                self.assertEqual(type(policy["capability_evidence_revision"]), int)
+                self.assertGreater(policy["capability_evidence_revision"], 0)
         phrase_bias_strategies = {
             family["execution"]["phrase_bias_strategy"]
             for family in inventory.values()

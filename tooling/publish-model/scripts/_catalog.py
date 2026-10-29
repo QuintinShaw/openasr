@@ -114,7 +114,7 @@ _INVENTORY_EXECUTION_KEYS = {
     "invocation_span",
 }
 _INVENTORY_EXECUTION_CAPABILITIES_KEYS = {"cpu", "providers"}
-_INVENTORY_PROVIDER_KEYS = {"provider", "full_device", "hybrid"}
+_INVENTORY_PROVIDER_KEYS = {"provider", "full_device", "hybrid", "decode_reuse_policy"}
 _INVENTORY_INVOCATION_KEYS = {"policy", "max_seconds"}
 _INVENTORY_TOPOLOGY_KEYS = {
     "decode_driver",
@@ -387,6 +387,13 @@ def _validate_model_family_inventory(payload: object) -> None:
             if provider["provider"] in seen_providers:
                 raise _inventory_error(f"{provider_path}.provider", "duplicate provider")
             seen_providers.add(provider["provider"])
+            reuse = _inventory_object(provider["decode_reuse_policy"], f"{provider_path}.decode_reuse_policy")
+            _inventory_exact_keys(reuse, {"graph_mode", "capability_evidence_revision"}, f"{provider_path}.decode_reuse_policy")
+            if reuse["graph_mode"] not in {"fresh_graph", "reusable_graph"}:
+                raise _inventory_error(provider_path, "invalid decode graph policy")
+            revision = reuse["capability_evidence_revision"]
+            if type(revision) is not int or revision <= 0:
+                raise _inventory_error(provider_path, "decode evidence revision must be a positive integer")
             for field in ("full_device", "hybrid"):
                 if not isinstance(provider[field], bool):
                     raise _inventory_error(f"{provider_path}.{field}", "must be boolean")

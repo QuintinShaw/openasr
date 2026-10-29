@@ -450,6 +450,14 @@ struct GgmlLaneReuseEvidence {
 }
 
 impl GgmlLaneReuseEvidence {
+    const fn mode(self) -> GgmlDecodeReuseMode {
+        if self.is_validated() {
+            GgmlDecodeReuseMode::ReusableGraph
+        } else {
+            GgmlDecodeReuseMode::FreshGraph
+        }
+    }
+
     const fn unknown() -> Self {
         Self {
             persistent_input_refresh: GgmlLaneEvidence::Unknown,
@@ -558,6 +566,20 @@ impl GgmlLaneDecodeEvidence {
 }
 
 const GGML_DECODE_LANE_EVIDENCE_REVISION: u64 = 2;
+
+/// Conditional planner policy for an admitted provider lane, not proof that a
+/// device exists or that a particular request executed on it. Qualification
+/// still requires live placement, graph lifecycle and complete-output evidence.
+pub(crate) fn provider_decode_reuse_policy(
+    provider: ExecutionProvider,
+) -> (GgmlDecodeReuseMode, u64) {
+    let evidence = if discrete_gpu_reuse_is_proven(provider) {
+        GgmlLaneDecodeEvidence::discrete_gpu_reusable_full_logits()
+    } else {
+        GgmlLaneDecodeEvidence::unknown()
+    };
+    (evidence.reuse.mode(), GGML_DECODE_LANE_EVIDENCE_REVISION)
+}
 
 fn lane_decode_evidence_for_preference(
     preference: Option<&RequestBackendPreference>,
@@ -1290,11 +1312,7 @@ impl ResolvedFamilyRuntimeInput {
             decode_evidence: evidence,
             evidence_revision: GGML_DECODE_LANE_EVIDENCE_REVISION,
             output_plan: plan_decode_output(output_contract, evidence, logits_consumers),
-            reuse_mode: if evidence.reuse.is_validated() {
-                GgmlDecodeReuseMode::ReusableGraph
-            } else {
-                GgmlDecodeReuseMode::FreshGraph
-            },
+            reuse_mode: evidence.reuse.mode(),
         }
     }
 
@@ -15450,6 +15468,49 @@ mod tests {
                 GgmlDecodeOutputPlan::FullLogits,
                 "complete-logits consumers must not compact on unproven {provider:?}"
             );
+        }
+    }
+
+    #[test]
+    fn exported_reuse_policy_matches_planner_for_all_provider_capabilities() {
+        use crate::device::execution_route::ExecutionProvider;
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let backend = match provider {
+                ExecutionProvider::Cpu => super::GgmlCpuGraphBackend::Cpu,
+                ExecutionProvider::Metal => super::GgmlCpuGraphBackend::Metal,
+                _ => super::GgmlCpuGraphBackend::Gpu,
+            };
+            for native_argmax in [false, true] {
+                let capabilities =
+                    super::GgmlBackendCapabilities::resolve(backend, provider.as_str())
+                        .with_native_argmax_first_op(native_argmax);
+                let evidence = super::lane_decode_evidence_for_backend_capabilities(
+                    backend,
+                    capabilities,
+                    provider,
+                );
+                let (exported, revision) = super::provider_decode_reuse_policy(provider);
+                assert_eq!(
+                    exported,
+                    evidence.reuse.mode(),
+                    "{provider:?} argmax={native_argmax}"
+                );
+                assert_eq!(revision, super::GGML_DECODE_LANE_EVIDENCE_REVISION);
+                if matches!(
+                    provider,
+                    ExecutionProvider::Unknown | ExecutionProvider::Accelerator
+                ) {
+                    assert_eq!(exported, super::GgmlDecodeReuseMode::FreshGraph);
+                }
+            }
         }
     }
 

@@ -90,12 +90,12 @@ def _public_models(catalog: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
-def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, list[str]]]:
+def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, list[str], dict[str, Any]]]:
     execution = descriptor.get("execution", {})
     capabilities = execution.get("execution_capabilities", {}) if isinstance(execution, dict) else {}
     optimization = descriptor.get("optimization", {})
     auto_policy = optimization.get("auto_gpu_policy") if isinstance(optimization, dict) else None
-    result: list[tuple[str, str, list[str]]] = []
+    result: list[tuple[str, str, list[str], dict[str, Any]]] = []
     providers = capabilities.get("providers", [])
     if not isinstance(providers, list):
         raise MatrixError(f"family {descriptor.get('catalog_family_id')} has invalid providers")
@@ -109,11 +109,20 @@ def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, li
         modes = ["explicit"]
         if auto_policy == "all-backends" or (auto_policy == "except-metal" and provider != "metal"):
             modes.append("auto")
-        result.append((provider, placement, modes))
+        reuse = item.get("decode_reuse_policy")
+        if (
+            not isinstance(reuse, dict)
+            or set(reuse) != {"graph_mode", "capability_evidence_revision"}
+            or reuse.get("graph_mode") not in {"fresh_graph", "reusable_graph"}
+            or type(reuse.get("capability_evidence_revision")) is not int
+            or reuse["capability_evidence_revision"] <= 0
+        ):
+            raise MatrixError(f"family {descriptor.get('catalog_family_id')} has no typed decode reuse policy")
+        result.append((provider, placement, modes, reuse))
     return result
 
 
-def _lane_policies(provider: str) -> tuple[str, str, str]:
+def _lane_policies(provider: str) -> tuple[str, str]:
     """Return explicit staging policies, not claims of successful hardware runs."""
     # HIP is the sole shipping lane compiled with executable-graph capture.
     # CUDA is currently built with GGML_CUDA_GRAPHS=OFF; CPU, Vulkan, and
@@ -122,9 +131,9 @@ def _lane_policies(provider: str) -> tuple[str, str, str]:
     # distinct `disabled` cell and must provide a native disabled observation.
     capture = "enabled" if provider == "hip" else "unsupported"
     scheduler = "disabled"
-    # Production reuse evidence is currently Unknown, so qualification must
-    # exercise the shipped FreshGraph plan in both cold- and warm-process rows.
-    return capture, scheduler, "fresh_graph"
+    # Reuse is exported by the shared typed runtime planner; it is independent
+    # of executable capture and remains subject to live exact-cell evidence.
+    return capture, scheduler
 
 
 def _tie_policy(family: str) -> str:
@@ -449,11 +458,11 @@ def project_matrix(
         topology = descriptor.get("topology")
         if not isinstance(topology, dict):
             raise MatrixError(f"family {family} has no topology projection")
-        for provider, placement, modes in _advertised_providers(descriptor):
+        for provider, placement, modes, reuse in _advertised_providers(descriptor):
             provider_candidates = backend_candidates.get(provider, [])
             if not provider_candidates:
                 continue
-            capture_mode, scheduler_mode, graph_mode = _lane_policies(provider)
+            capture_mode, scheduler_mode = _lane_policies(provider)
             tie_policy = _tie_policy(family)
             for model in sorted(grouped[family], key=lambda item: str(item["id"])):
                 quants = [
@@ -488,7 +497,8 @@ def project_matrix(
                             "placement": placement,
                             "capture_mode": capture_mode,
                             "scheduler_mode": scheduler_mode,
-                            "graph_mode": graph_mode,
+                            "graph_mode": reuse["graph_mode"],
+                            "capability_evidence_revision": reuse["capability_evidence_revision"],
                             "topology": {
                                 "decode_driver": topology.get("decode_driver"),
                                 "decoder_state": topology.get("decoder_state"),
@@ -1460,6 +1470,8 @@ def expected_receipt_keys(matrix: dict[str, Any]) -> tuple[
             raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks capture/scheduler policy")
         if cell.get("graph_mode") not in {"fresh_graph", "reusable_graph"}:
             raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks graph-mode policy")
+        if type(cell.get("capability_evidence_revision")) is not int or cell["capability_evidence_revision"] <= 0:
+            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks decode evidence revision")
         plan = cell["output_plan"]
         if plan.get("kind") not in {"full_logits", "complete_scores", "native_first_max_token"} or plan.get("tie_policy") not in {"first_maximum", "last_maximum"}:
             raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks a concrete output plan")
@@ -1676,6 +1688,8 @@ def closed_receipt_keys(
         if (
             not isinstance(decode_diagnostics, dict)
             or decode_diagnostics.get("reuse_mode") != lane["graph_mode"]
+            or type(decode_diagnostics.get("capability_evidence_revision")) is not int
+            or decode_diagnostics["capability_evidence_revision"] != lane["capability_evidence_revision"]
         ):
             raise MatrixError(f"{path} graph mode does not match its matrix cell")
         key = (
@@ -2635,7 +2649,7 @@ def bind_runtime_cell_receipts(
         or diagnostics.get("output_plan") != cell["output_plan"]["kind"]
         or diagnostics.get("reuse_mode") != cell["graph_mode"]
         or type(diagnostics.get("capability_evidence_revision")) is not int
-        or diagnostics["capability_evidence_revision"] <= 0
+        or diagnostics["capability_evidence_revision"] != cell["capability_evidence_revision"]
     ):
         raise MatrixError("GPU receipt did not execute the projected output/graph plan")
     _require_runtime_placement(
