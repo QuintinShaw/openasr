@@ -860,9 +860,15 @@ fn default_model_response_from_served(
     let pack = packs
         .into_iter()
         .find(|pack| pack.path == served.snapshot.path());
+    if let Some(pack) = &pack {
+        validate_installed_default_identity(served, pack)?;
+    }
     Ok(DefaultModelResponse {
         object: "model.default",
-        default_model: Some(served.identity.model_id.clone()),
+        default_model: Some(pack.as_ref().map_or_else(
+            || served.identity.model_id.clone(),
+            |pack| pack.model_id.clone(),
+        )),
         default_model_status: if pack.is_some() {
             "installed"
         } else {
@@ -873,6 +879,51 @@ fn default_model_response_from_served(
         activation: DefaultModelActivationState::Committed,
         idle_switch_pending: None,
     })
+}
+
+pub(crate) fn validate_installed_default_identity(
+    served: &crate::ServedNativePack,
+    pack: &InstalledPack,
+) -> Result<(), ApiError> {
+    // A published pack may carry a quant-qualified runtime metadata id.
+    // Project its installed product identity only after matching this exact
+    // verified generation and (when present) the live attestation digest.
+    // Never recover identity from a newer durable selection or strip suffixes.
+    let matches_verified_pack = served
+        .adapter
+        .verified_pack_matches_model_ref(&format!("{}:{}", pack.model_id, pack.quant))
+        .map_err(|error| {
+            ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
+                reason: format!(
+                    "could not match installed default to verified served pack: {error}"
+                ),
+            })
+        })?;
+    let (verified_content_id, verified_size) = served
+        .adapter
+        .verified_pack_content_identity()
+        .map_err(|error| {
+            ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
+                reason: format!("could not resolve verified served content identity: {error}"),
+            })
+        })?;
+    let matches_descriptor = verified_content_id == format!("sha256:{}", pack.sha256)
+        && verified_size == pack.size_bytes;
+    let matches_attestation = match served.snapshot.residency_key() {
+        idle_activity::NativeRuntimeResidencyKey::AttestedContent(content_id) => {
+            content_id == verified_content_id
+        }
+        idle_activity::NativeRuntimeResidencyKey::LegacyPath(_) => true,
+    };
+    if !matches_verified_pack || !matches_descriptor || !matches_attestation {
+        return Err(ApiError::Backend(
+            openasr_core::BackendError::NativeFailClosed {
+                reason: "installed default descriptor does not match the verified served pack"
+                    .to_string(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn default_model_response_with_idle_switch(
