@@ -1,6 +1,76 @@
 use super::*;
 use std::fs;
 
+#[test]
+fn closed_stderr_does_not_turn_catalog_diagnostics_into_a_panic() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "registry::tests::catalog::closed_stderr_catalog_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("OPENASR_CATALOG_STDERR_CHILD", home.path())
+        .env("OPENASR_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take());
+    child.stdin.take().unwrap().write_all(b"go").unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(15) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("closed stderr catalog child timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "catalog loading failed with closed stderr: {status}"
+    );
+    assert_eq!(
+        fs::read(home.path().join("catalog-child-complete")).unwrap(),
+        b"verified"
+    );
+}
+
+#[test]
+#[ignore = "isolated child of closed_stderr_does_not_turn_catalog_diagnostics_into_a_panic"]
+fn closed_stderr_catalog_child() {
+    use std::io::Read;
+    let home = PathBuf::from(std::env::var_os("OPENASR_CATALOG_STDERR_CHILD").unwrap());
+    let mut barrier = [0; 2];
+    std::io::stdin().read_exact(&mut barrier).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&catalog_json()).unwrap();
+    value["models"][0]["kind"] = serde_json::json!("future-asr-model-v999");
+    let contents = serde_json::to_string(&value).unwrap();
+    let filtered = parse_model_catalog(&contents, "closed-stderr-fixture").unwrap();
+    assert_eq!(filtered.models.len(), 1);
+    assert_eq!(filtered.models[0].id, "moonshine-base");
+    value["schema_version"] = serde_json::json!(999);
+    assert!(parse_model_catalog(&serde_json::to_string(&value).unwrap(), "invalid").is_err());
+    // Exercise the real signature-verified embedded catalog and its normal
+    // compatibility filtering too, rather than bypassing catalog security.
+    assert!(
+        !load_embedded_signed_catalog(&home)
+            .unwrap()
+            .models
+            .is_empty()
+    );
+    fs::write(home.join("catalog-child-complete"), b"verified").unwrap();
+}
+
 fn catalog_json() -> String {
     r#"{
   "schema_version": 1,
