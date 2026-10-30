@@ -239,6 +239,17 @@ impl NativeRuntimeModelAdapter {
         ))
     }
 
+    /// Content identity and length of this adapter's already verified open
+    /// generation. Diagnostic projections must compare this proof rather than
+    /// reopen a path that may now name a different generation.
+    pub fn verified_pack_content_identity(&self) -> Result<(&str, u64), NativeAsrError> {
+        let verified = self.verified_pack()?;
+        Ok((
+            verified.content_id(),
+            verified.preflight().runtime_source().byte_len(),
+        ))
+    }
+
     /// Bind a caller-visible model id to the exact verified source generation
     /// that produced this adapter. Product offline and streaming execution use
     /// this constructor so the proof crosses the executor seam with the pack

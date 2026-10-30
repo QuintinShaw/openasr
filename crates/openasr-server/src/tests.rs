@@ -468,6 +468,16 @@ fn write_valid_installed_pack_for_test(
     quant: &str,
     suffix: &str,
 ) -> InstalledPack {
+    write_valid_installed_pack_with_runtime_id_for_test(home, model_id, quant, suffix, model_id)
+}
+
+fn write_valid_installed_pack_with_runtime_id_for_test(
+    home: &Path,
+    model_id: &str,
+    quant: &str,
+    suffix: &str,
+    runtime_model_id: &str,
+) -> InstalledPack {
     let filename = format!("{model_id}-{quant}.oasr");
     let models = home.join("models");
 
@@ -476,7 +486,7 @@ fn write_valid_installed_pack_for_test(
     let scratch = models.join("fixture-source");
     fs::create_dir_all(&scratch).expect("create fixture dir");
     let staged = scratch.join(&filename);
-    write_mock_gguf_runtime_source(&staged, Some(model_id));
+    write_mock_gguf_runtime_source(&staged, Some(runtime_model_id));
     let bytes = fs::read(&staged).expect("read installed pack fixture");
     fs::remove_dir_all(&scratch).expect("drop fixture staging dir");
 
@@ -1584,6 +1594,180 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
         Some("whisper-small:q8")
     );
     assert_eq!(installed.activation, DefaultModelActivationState::Committed);
+}
+
+#[tokio::test]
+async fn default_model_keeps_canonical_installed_identity_across_attestation_and_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_with_runtime_id_for_test(
+        temp.path(),
+        "moonshine-tiny",
+        "q8_0",
+        "q8",
+        "moonshine-tiny-q8_0",
+    );
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let durable_path = temp.path().join("default-selection.json");
+    let durable_before = fs::read(&durable_path).unwrap();
+    let make_runtime = || ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack.path.clone())),
+    };
+    let runtime = make_runtime();
+    let app = |runtime| {
+        app_with_runtime_and_distribution(
+            runtime,
+            DistributionRuntime {
+                openasr_home: Some(temp.path().to_path_buf()),
+                catalog_url: None,
+                catalog_local_override: None,
+            },
+        )
+    };
+    let assert_default = |body: &serde_json::Value| {
+        assert_eq!(body["default_model"], "moonshine-tiny");
+        assert_eq!(body["default_pull"], "moonshine-tiny:q8");
+        assert_eq!(body["pack"]["quant"], "q8_0");
+        assert_eq!(body["pack"]["sha256"], pack.sha256);
+        assert_eq!(body["activation"], "committed");
+    };
+    let (status, before) = issue_376_get_json(app(runtime.clone()), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_default(&before);
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .unwrap();
+    let resolved = openasr_core::resolve_default_model_activation(
+        runtime.native_execution.execution_services().as_ref(),
+        &verified,
+        openasr_core::device::execution_policy::ExecutionIntent::from(
+            openasr_core::ExecutionTarget::Cpu,
+        ),
+        pack.pull.clone(),
+        pack.path.clone(),
+    )
+    .unwrap();
+    runtime.publish_attested_native_model(resolved.facts().identity().clone());
+    assert_eq!(
+        runtime
+            .resolve_served_native_pack()
+            .unwrap()
+            .unwrap()
+            .identity
+            .model_id,
+        "moonshine-tiny-q8_0",
+        "The original verified runtime metadata identity must remain intact"
+    );
+    let (status, active) = issue_376_get_json(app(runtime.clone()), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_default(&active);
+    let (status, restarted) = issue_376_get_json(app(make_runtime()), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_default(&restarted);
+    assert_eq!(
+        fs::read(&durable_path).unwrap(),
+        durable_before,
+        "Reads/restart must not rewrite V2 generation or checksum"
+    );
+    let other = write_valid_installed_pack_with_runtime_id_for_test(
+        temp.path(),
+        "moonshine-tiny",
+        "q4_k",
+        "q4",
+        "moonshine-tiny-q4_k",
+    );
+    persist_default_pack(temp.path(), &other, QuantPreference::pinned(&other.quant)).unwrap();
+    let (status, still_served) = issue_376_get_json(app(runtime), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_default(&still_served);
+}
+
+#[test]
+fn installed_default_identity_rejects_content_size_quant_and_attestation_mismatches() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_with_runtime_id_for_test(
+        temp.path(),
+        "moonshine-tiny",
+        "q8_0",
+        "q8",
+        "moonshine-tiny-q8_0",
+    );
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack.path.clone())),
+    };
+    let mut served = runtime.resolve_served_native_pack().unwrap().unwrap();
+    validate_installed_default_identity(&served, &pack).unwrap();
+    for change in ["sha", "size", "quant", "model"] {
+        let mut wrong = pack.clone();
+        match change {
+            "sha" => wrong.sha256 = "0".repeat(64),
+            "size" => wrong.size_bytes += 1,
+            "quant" => wrong.quant = "q4_k".to_string(),
+            "model" => wrong.model_id = "unrelated-model".to_string(),
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_installed_default_identity(&served, &wrong).is_err(),
+            "accepted mismatched {change}"
+        );
+    }
+    served.snapshot.residency_key =
+        idle_activity::NativeRuntimeResidencyKey::attested(format!("sha256:{}", pack.sha256));
+    validate_installed_default_identity(&served, &pack).unwrap();
+    served.snapshot.residency_key =
+        idle_activity::NativeRuntimeResidencyKey::attested(format!("sha256:{}", "0".repeat(64)));
+    assert!(validate_installed_default_identity(&served, &pack).is_err());
+}
+
+#[test]
+fn installed_default_identity_rejects_same_path_replacement_with_same_runtime_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_with_runtime_id_for_test(
+        temp.path(),
+        "moonshine-tiny",
+        "q8_0",
+        "q8",
+        "moonshine-tiny-q8_0",
+    );
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack.path.clone())),
+    };
+    let mut served = runtime.resolve_served_native_pack().unwrap().unwrap();
+    served.snapshot.residency_key =
+        idle_activity::NativeRuntimeResidencyKey::attested(format!("sha256:{}", pack.sha256));
+    let replacement = temp.path().join("replacement.oasr");
+    let mut spec = TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny-q8_0");
+    spec.metadata.insert(
+        "general.description".to_string(),
+        "another verified generation".to_string(),
+    );
+    write_tiny_gguf_runtime_source(&replacement, &spec).unwrap();
+    fs::rename(replacement, &pack.path).unwrap();
+    let adapter = validate_native_runtime_pack(&pack.path).unwrap();
+    let identity = resolve_verified_native_runtime_model_identity(&adapter, None).unwrap();
+    assert_eq!(identity.model_id, served.identity.model_id);
+    served.adapter = adapter;
+    assert!(
+        validate_installed_default_identity(&served, &pack).is_err(),
+        "old descriptor and old attestation cannot vouch for new same-id contents"
+    );
+    served.snapshot.residency_key =
+        idle_activity::NativeRuntimeResidencyKey::legacy_path(&pack.path);
+    assert!(
+        validate_installed_default_identity(&served, &pack).is_err(),
+        "legacy paths also require exact verified content identity"
+    );
 }
 
 #[test]

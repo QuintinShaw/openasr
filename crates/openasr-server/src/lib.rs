@@ -1494,6 +1494,7 @@ impl ActiveRuntimeSnapshot {
 pub(crate) struct ServedNativePack {
     pub snapshot: ActiveRuntimeSnapshot,
     pub identity: openasr_core::NativeRuntimeModelIdentity,
+    pub adapter: openasr_core::NativeRuntimeModelAdapter,
 }
 
 impl std::fmt::Debug for ActiveRuntimeSlot {
@@ -1972,7 +1973,11 @@ impl ServerRuntime {
         let adapter = validate_native_runtime_pack(snapshot.path()).map_err(ApiError::Backend)?;
         let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
             .map_err(ApiError::Backend)?;
-        Ok(Some(ServedNativePack { snapshot, identity }))
+        Ok(Some(ServedNativePack {
+            snapshot,
+            identity,
+            adapter,
+        }))
     }
 
     pub(crate) fn native_rebind_blocked(&self) -> bool {
