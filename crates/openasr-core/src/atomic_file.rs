@@ -370,17 +370,31 @@ impl AtomicFileSystem for RealAtomicFileSystem {
             // SAFETY: both buffers are live, NUL-terminated UTF-16 paths. The
             // flags request the Windows equivalent of Unix rename-over-target
             // and flush the rename before returning.
-            if unsafe {
-                MoveFileExW(
-                    from_wide.as_ptr(),
-                    to_wide.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
+            let started = std::time::Instant::now();
+            loop {
+                if unsafe {
+                    MoveFileExW(
+                        from_wide.as_ptr(),
+                        to_wide.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    )
+                } != 0
+                {
+                    return Ok(());
+                }
+                let error = io::Error::last_os_error();
+                // A reader without FILE_SHARE_DELETE can make replacement
+                // return ACCESS_DENIED as well as SHARING/LOCK_VIOLATION.
+                // Retry only this uncommitted rename, using the same synced
+                // staging file. Never remove the target or change its ACLs;
+                // permanent denials still return the last native error.
+                if !matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    || started.elapsed() >= std::time::Duration::from_millis(250)
+                {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Ok(())
         }
         #[cfg(not(windows))]
         {
@@ -476,6 +490,78 @@ pub(crate) fn sync_parent_dir_best_effort(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_temporary_deny_delete_reader_does_not_lose_atomic_write() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("config.json");
+        fs::write(&target, b"old").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&target)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(reader);
+        });
+        let result = write_file_atomically_detailed(&target, b"new", AtomicFileMode::Default);
+        release.join().unwrap();
+        assert!(matches!(result.unwrap(), AtomicWriteOutcome::Written));
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_persistent_deny_delete_reader_fails_without_committing_or_orphans() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("config.json");
+        fs::write(&target, b"old").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&target)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let AtomicWriteError::NotCommitted(error) =
+            write_file_atomically_detailed(&target, b"new", AtomicFileMode::Default).unwrap_err();
+        assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+        drop(reader);
+        write_file_atomically(&target, b"recovered").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"recovered");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_readonly_target_is_not_made_writable_to_complete_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("config.json");
+        fs::write(&target, b"old").unwrap();
+        let original = fs::metadata(&target).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&target, readonly).unwrap();
+        let result = write_file_atomically_detailed(&target, b"new", AtomicFileMode::Default);
+        let still_readonly = fs::metadata(&target).unwrap().permissions().readonly();
+        let contents = fs::read(&target).unwrap();
+        let entries = fs::read_dir(home.path()).unwrap().count();
+        fs::set_permissions(&target, original).unwrap();
+        assert!(matches!(result, Err(AtomicWriteError::NotCommitted(_))));
+        assert!(still_readonly);
+        assert_eq!(contents, b"old");
+        assert_eq!(entries, 1);
+    }
 
     #[cfg(windows)]
     #[test]
